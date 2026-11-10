@@ -187,12 +187,15 @@ The module decodes **112-bit Downlink Format 17 (DF17)** and **DF18** extended s
 ## 📁 Repository Structure
 
 ```text
+micro-adsb-radar/
+├── .gitignore          # Git ignore rules (caches, virtual environments, logs)
+├── LICENSE             # MIT open-source license
+├── README.md           # Documentation and hardware setup guide
 ├── config.json         # Centralized configuration (serial, observer, radar)
 ├── decoder.py          # Standalone pure-Python ADS-B/Mode-S decoding engine
 ├── main.py             # Live terminal radar dashboard application
 ├── recorder.py         # Standalone raw packet recording utility
-├── sample_flight.txt   # Flight data sample for offline testing & demo
-└── README.md           # Documentation and hardware setup guide
+└── sample_flight.txt   # Flight data sample for offline testing & demo
 ```
 
 ---
