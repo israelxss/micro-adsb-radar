@@ -1,0 +1,21 @@
+{
+  "serial": {
+    "port": "COM12",
+    "baudrate": 115200,
+    "timeout": 0.2
+  },
+  "observer": {
+    "enabled": true,
+    "latitude": 51.4700,
+    "longitude": -0.4543
+  },
+  "radar": {
+    "prune_timeout_seconds": 30.0,
+    "stale_timeout_seconds": 10.0,
+    "cpr_pair_max_interval_seconds": 10.0
+  },
+  "logging": {
+    "save_raw_traffic": false,
+    "raw_traffic_file": "adsb_traffic.log"
+  }
+}
