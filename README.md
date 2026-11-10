@@ -3,10 +3,10 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![GitHub](https://img.shields.io/badge/GitHub-israelxss%2Fmicro--adsb--radar-green)](https://github.com/israelxss/micro-adsb-radar)
 
-A lightweight, standalone ADS-B and Mode-S receiver and flight radar for terminal environments. 
+A lightweight, standalone ADS-B and Mode-S receiver, live terminal flight radar, and UDP network streaming suite. 
 Repository: [https://github.com/israelxss/micro-adsb-radar](https://github.com/israelxss/micro-adsb-radar) 
 
-The project has **zero dependency on `pyModeS`** or any heavy SDR framework. The core decoder is written in 100% pure Python, relying solely on **`pyserial`** for serial communications.
+The project has **zero dependency on `pyModeS`** or any heavy SDR framework. The core decoder is written in 100% pure Python, relying solely on **`pyserial`** for serial communications and Python's built-in standard library for networking.
 
 > [!NOTE]
 > **Privacy Notice:**  
@@ -54,9 +54,13 @@ Connect the module to your 3.3V FTDI / USB-UART bridge as follows:
 * **Dual CPR Positioning Engine:**
   * **Local Single-Frame CPR:** Instant latitude/longitude decoding from the very first frame using the observer location as a reference.
   * **Global CPR (No Observer Required):** Automatically resolves aircraft positions without requiring observer coordinates by pairing Even and Odd frames.
+* **UDP Streaming & Network Server:**
+  * **UDP Server / Broadcaster:** Stream raw packets over local UDP or subnet broadcast (`255.255.255.255`) to multiple clients across your local network.
+  * **UDP Terminal Radar Client:** Run the visual radar dashboard remotely over UDP without physical USB access to the receiver.
+  * **Standalone UDP Decoder Module:** Programmatic Python client (`udp_client.py`) for headless decoding, automation, and JSON streaming.
 * **Auto-Pruning Inactive Aircraft:** Automatically drops stale aircraft that haven't transmitted for 30 seconds.
 * **Rich Terminal UI with Fallback:** Beautiful real-time dashboard powered by `rich` (if installed) with an automatic pure-Python ANSI fallback.
-* **Configurable:** Centralized `config.json` file for serial port, observer location, timeouts, and logging.
+* **Configurable:** Centralized `config.json` file for serial port, observer location, timeouts, and network settings.
 
 ---
 
@@ -99,6 +103,13 @@ The application parameters can be customized in `config.json` *(values below are
     "stale_timeout_seconds": 10.0,
     "cpr_pair_max_interval_seconds": 10.0
   },
+  "udp": {
+    "listen_host": "0.0.0.0",
+    "listen_port": 5005,
+    "target_host": "127.0.0.1",
+    "target_port": 5005,
+    "broadcast": false
+  },
   "logging": {
     "save_raw_traffic": false,
     "raw_traffic_file": "adsb_traffic.log"
@@ -130,18 +141,56 @@ Run without observer coordinates (Global CPR mode):
 python main.py --no-observer
 ```
 
-### 2. Instant Demo Mode (Simulation Replay)
+### 2. Live Radar over UDP (Remote / Network Mode)
+Listen for ADS-B datagrams streamed over the network on UDP port 5005:
+```bash
+python main.py --udp 5005
+```
+
+Forward local serial packets to a UDP destination while running the radar:
+```bash
+python main.py --forward-udp 127.0.0.1:5005
+```
+
+### 3. UDP Streaming Server (`udp_server.py`)
+Stream live serial packets to a local UDP port or broadcast to your entire subnet:
+```bash
+# Unicast to local client
+python udp_server.py --port COM12 --baud 115200 --target-host 127.0.0.1 --target-port 5005
+
+# Subnet Broadcast to all devices on the LAN
+python udp_server.py --port COM12 --baud 115200 --broadcast --target-port 5005
+
+# Simulate streaming from bundled flight log
+python udp_server.py --demo --target-port 5005 --speed 2.0
+```
+
+### 4. Standalone UDP Decoder Client (`udp_client.py`)
+Receive and decode packets directly from a UDP stream (CLI or headless service):
+```bash
+# Human-readable live telemetry stream
+python udp_client.py --port 5005
+
+# Stream output as JSON lines (NDJSON)
+python udp_client.py --port 5005 --json
+```
+
+**Programmatic Python Usage:**
+```python
+from udp_client import UdpAdsbClient
+
+client = UdpAdsbClient(host="0.0.0.0", port=5005, observer_lat=51.47, observer_lon=-0.45)
+for aircraft in client.listen():
+    print(f"ICAO: {aircraft['icao']} | Alt: {aircraft.get('altitude')} ft | Dist: {aircraft.get('distance_km')} km")
+```
+
+### 5. Instant Demo Mode (Simulation Replay)
 Tests the dashboard immediately using the bundled flight data (`sample_flight.txt`):
 ```bash
 python main.py --demo --speed 2.0
 ```
 
-### 3. Replay a Recorded Traffic File
-```bash
-python main.py --file sample_flight.txt --speed 1.0
-```
-
-### 4. Record Raw Traffic Stream
+### 6. Record Raw Traffic Stream
 Use the bundled `recorder.py` utility to capture raw packets:
 ```bash
 python recorder.py --port COM12 --baud 115200 --out my_flight_dump.log
@@ -191,11 +240,13 @@ micro-adsb-radar/
 ├── .gitignore          # Git ignore rules (caches, virtual environments, logs)
 ├── LICENSE             # MIT open-source license
 ├── README.md           # Documentation and hardware setup guide
-├── config.json         # Centralized configuration (serial, observer, radar)
+├── config.json         # Centralized configuration (serial, observer, UDP, radar)
 ├── decoder.py          # Standalone pure-Python ADS-B/Mode-S decoding engine
-├── main.py             # Live terminal radar dashboard application
+├── main.py             # Live terminal radar dashboard application (Serial & UDP)
 ├── recorder.py         # Standalone raw packet recording utility
-└── sample_flight.txt   # Flight data sample for offline testing & demo
+├── sample_flight.txt   # Flight data sample for offline testing & demo
+├── udp_client.py       # Standalone UDP ADS-B receiver & telemetry decoder module
+└── udp_server.py       # UDP streaming broadcaster from serial or flight log
 ```
 
 ---

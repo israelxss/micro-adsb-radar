@@ -14,6 +14,13 @@
     "stale_timeout_seconds": 10.0,
     "cpr_pair_max_interval_seconds": 10.0
   },
+  "udp": {
+    "listen_host": "0.0.0.0",
+    "listen_port": 5005,
+    "target_host": "127.0.0.1",
+    "target_port": 5005,
+    "broadcast": false
+  },
   "logging": {
     "save_raw_traffic": false,
     "raw_traffic_file": "adsb_traffic.log"

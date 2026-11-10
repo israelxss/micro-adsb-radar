@@ -2,7 +2,7 @@
 """
 ADS-B Real-Time Terminal Radar & Telemetry Tracker
 Zero dependency on pyModeS. Only requires 'pyserial'.
-Compatible with USB-UART (CH340 / CH341 / FTDI) at 3.3V logic level.
+Supports Serial USB-UART (3.3V) and UDP network streaming / reception.
 """
 
 import sys
@@ -11,6 +11,7 @@ import re
 import json
 import time
 import math
+import socket
 import threading
 import argparse
 from datetime import datetime
@@ -69,6 +70,13 @@ def load_config() -> dict:
             "prune_timeout_seconds": 30.0,
             "stale_timeout_seconds": 10.0,
             "cpr_pair_max_interval_seconds": 10.0
+        },
+        "udp": {
+            "listen_host": "0.0.0.0",
+            "listen_port": 5005,
+            "target_host": "127.0.0.1",
+            "target_port": 5005,
+            "broadcast": False
         },
         "logging": {
             "save_raw_traffic": False,
@@ -506,10 +514,72 @@ def render_ansi_fallback(tracker: RadarTracker, port_info: str):
     sys.stdout.flush()
 
 # ============================================================================
-# Background Threads (Serial / Playback)
+# Background Threads (Serial / Playback / UDP)
 # ============================================================================
 
-def serial_reader_worker(port: str, baud: int, timeout: float, tracker: RadarTracker, stop_event: threading.Event, save_file: str | None):
+def udp_reader_worker(
+    host: str,
+    port: int,
+    tracker: RadarTracker,
+    stop_event: threading.Event,
+    save_file: str | None = None
+):
+    tracker.status_message = f"Binding UDP {host}:{port}..."
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind((host, port))
+        sock.settimeout(0.5)
+        tracker.is_connected = True
+        tracker.status_message = f"ONLINE (UDP :{port})"
+        tracker.log_event(f"UDP listener bound @ {host}:{port}")
+    except Exception as e:
+        tracker.status_message = f"UDP ERROR: {e}"
+        tracker.log_event(f"Failed to bind UDP {host}:{port}: {e}")
+        stop_event.set()
+        return
+
+    f_save = open(save_file, 'a', encoding='utf-8') if save_file else None
+
+    try:
+        while not stop_event.is_set():
+            try:
+                data, _ = sock.recvfrom(4096)
+            except socket.timeout:
+                continue
+            except Exception as e:
+                if not stop_event.is_set():
+                    tracker.log_event(f"UDP receive error: {e}")
+                break
+
+            if data:
+                tracker.total_bytes += len(data)
+                text = data.decode('utf-8', errors='ignore')
+                for raw_line in text.splitlines():
+                    raw_line = raw_line.strip()
+                    if raw_line:
+                        tracker.total_raw_packets += 1
+                        if f_save:
+                            ts_full = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+                            f_save.write(f"[{ts_full}] {raw_line}\n")
+                            f_save.flush()
+                        tracker.process_raw_line(raw_line)
+    finally:
+        sock.close()
+        if f_save:
+            f_save.close()
+        tracker.is_connected = False
+        tracker.status_message = "UDP STOPPED"
+
+def serial_reader_worker(
+    port: str,
+    baud: int,
+    timeout: float,
+    tracker: RadarTracker,
+    stop_event: threading.Event,
+    save_file: str | None,
+    udp_forward: tuple[socket.socket, tuple[str, int]] | None = None
+):
     tracker.status_message = f"Connecting to {port}..."
     try:
         ser = serial.Serial(
@@ -554,6 +624,12 @@ def serial_reader_worker(port: str, baud: int, timeout: float, tracker: RadarTra
                                     f_save.write(f"[{ts_full}] {raw_line}\n")
                                     f_save.flush()
 
+                                if udp_forward:
+                                    try:
+                                        udp_forward[0].sendto((raw_line + "\n").encode('utf-8', errors='replace'), udp_forward[1])
+                                    except Exception:
+                                        pass
+
                                 tracker.process_raw_line(raw_line)
                     else:
                         line_buf.append(b)
@@ -564,7 +640,13 @@ def serial_reader_worker(port: str, baud: int, timeout: float, tracker: RadarTra
         tracker.is_connected = False
         tracker.status_message = "DISCONNECTED"
 
-def file_reader_worker(file_path: str, tracker: RadarTracker, stop_event: threading.Event, speed: float = 1.0):
+def file_reader_worker(
+    file_path: str,
+    tracker: RadarTracker,
+    stop_event: threading.Event,
+    speed: float = 1.0,
+    udp_forward: tuple[socket.socket, tuple[str, int]] | None = None
+):
     if not os.path.exists(file_path):
         tracker.status_message = f"File Not Found: {file_path}"
         tracker.log_event(f"File not found: {file_path}")
@@ -584,8 +666,15 @@ def file_reader_worker(file_path: str, tracker: RadarTracker, stop_event: thread
             if stop_event.is_set():
                 break
 
-            tracker.total_raw_packets += 1
-            tracker.process_raw_line(line)
+            line_clean = line.strip()
+            if line_clean:
+                tracker.total_raw_packets += 1
+                if udp_forward:
+                    try:
+                        udp_forward[0].sendto((line_clean + "\n").encode('utf-8', errors='replace'), udp_forward[1])
+                    except Exception:
+                        pass
+                tracker.process_raw_line(line_clean)
 
             if delay > 0:
                 time.sleep(delay)
@@ -609,6 +698,12 @@ def main():
     parser.add_argument('--lon', type=float, help="Override observer longitude")
     parser.add_argument('--no-observer', action='store_true', help="Disable observer coordinates (Global CPR mode)")
     parser.add_argument('--speed', type=float, default=2.0, help="Replay speed multiplier (default: 2.0)")
+
+    # UDP Arguments
+    parser.add_argument('--udp', nargs='?', const=5005, type=int, help="Receive ADS-B datagrams over UDP port (default: 5005)")
+    parser.add_argument('--udp-host', default="0.0.0.0", help="UDP bind host when receiving via UDP (default: 0.0.0.0)")
+    parser.add_argument('--forward-udp', help="Forward received packets to UDP target host:port (e.g. 127.0.0.1:5005)")
+
     args = parser.parse_args()
 
     # Apply command-line overrides
@@ -628,6 +723,19 @@ def main():
     tracker = RadarTracker(config)
     stop_event = threading.Event()
 
+    # Optional UDP Forwarding Socket
+    udp_fwd_tuple = None
+    if args.forward_udp:
+        try:
+            parts = args.forward_udp.split(':')
+            fwd_host = parts[0]
+            fwd_port = int(parts[1]) if len(parts) > 1 else 5005
+            fwd_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            udp_fwd_tuple = (fwd_sock, (fwd_host, fwd_port))
+            tracker.log_event(f"UDP forwarding active to {fwd_host}:{fwd_port}")
+        except Exception as e:
+            print(f"[WARNING] Invalid --forward-udp format: {e}")
+
     target_file = None
     if args.demo:
         demo_candidate = os.path.join(os.path.dirname(__file__), 'sample_flight.txt')
@@ -637,18 +745,25 @@ def main():
     elif args.file:
         target_file = args.file
 
-    source_info = f"Demo ({os.path.basename(target_file)})" if target_file else f"{port} @ {baud}"
-
-    if target_file:
+    if args.udp:
+        source_info = f"UDP :{args.udp}"
+        reader = threading.Thread(
+            target=udp_reader_worker,
+            args=(args.udp_host, args.udp, tracker, stop_event, save_file),
+            daemon=True
+        )
+    elif target_file:
+        source_info = f"Demo ({os.path.basename(target_file)})"
         reader = threading.Thread(
             target=file_reader_worker,
-            args=(target_file, tracker, stop_event, args.speed),
+            args=(target_file, tracker, stop_event, args.speed, udp_fwd_tuple),
             daemon=True
         )
     else:
+        source_info = f"{port} @ {baud}"
         reader = threading.Thread(
             target=serial_reader_worker,
-            args=(port, baud, timeout, tracker, stop_event, save_file),
+            args=(port, baud, timeout, tracker, stop_event, save_file, udp_fwd_tuple),
             daemon=True
         )
 
@@ -665,6 +780,11 @@ def main():
             pass
         finally:
             stop_event.set()
+            if udp_fwd_tuple:
+                try:
+                    udp_fwd_tuple[0].close()
+                except Exception:
+                    pass
             reader.join(timeout=1.0)
             console.print("\n[bold yellow]Radar tracker stopped.[/]")
     else:
@@ -677,6 +797,11 @@ def main():
             pass
         finally:
             stop_event.set()
+            if udp_fwd_tuple:
+                try:
+                    udp_fwd_tuple[0].close()
+                except Exception:
+                    pass
             reader.join(timeout=1.0)
             print("\nRadar tracker stopped.")
 
