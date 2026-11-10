@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
 """
-ADS-B Real-Time Terminal Radar & Telemetry Tracker
-Zero dependency on pyModeS. Only requires 'pyserial'.
-Supports Serial USB-UART (3.3V) and UDP network streaming / reception.
+Micro ADS-B Radar & Telemetry Suite (1090 MHz)
+All-in-one pure Python ADS-B / Mode-S system:
+  1. Complete Pure-Python Decoding Engine (Zero pyModeS dependency)
+  2. Live Terminal Radar Dashboard (Rich UI + ANSI fallback)
+  3. UDP Server / Broadcaster (Unicast & Subnet Broadcast)
+  4. UDP Client & Headless JSON Streamer
+  5. Raw Traffic Recorder & Log Replay Simulator
+Only requires 'pyserial' for hardware serial communications.
 """
 
 import sys
@@ -16,8 +21,14 @@ import threading
 import argparse
 from datetime import datetime
 from collections import deque
+from typing import Generator, Optional, Dict, Any, Tuple
+from bisect import bisect_right
+from math import floor
 
-# Enable UTF-8 code page (65001) and Virtual Terminal Processing on Windows
+# ============================================================================
+# Windows Console UTF-8 & Virtual Terminal Setup
+# ============================================================================
+
 if sys.platform == 'win32':
     try:
         import ctypes
@@ -47,11 +58,12 @@ except ImportError:
 
 import serial
 
-import decoder
-
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), 'config.json')
-
 SPINNER_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
+
+# ============================================================================
+# SECTION 1: Configuration Management
+# ============================================================================
 
 def load_config() -> dict:
     """Loads configuration from config.json with fallback defaults."""
@@ -96,9 +108,9 @@ def load_config() -> dict:
 
     return default_config
 
-def parse_raw_line(line: str) -> tuple[str | None, int | None]:
+def parse_raw_line(line: str) -> Tuple[Optional[str], Optional[int]]:
     """
-    Parses hardware output:
+    Parses hardware and log lines:
     1. #MDS*<HEX>;(count,rssi,err,flags)
     2. AVR format: *<HEX>;
     """
@@ -117,7 +129,389 @@ def parse_raw_line(line: str) -> tuple[str | None, int | None]:
     return None, None
 
 # ============================================================================
-# Aircraft Telemetry Store
+# SECTION 2: Pure-Python ADS-B / Mode-S Decoding Engine
+# ============================================================================
+
+_CRC_POLY = 0xFFF409
+
+def _build_crc_table() -> tuple[int, ...]:
+    table = [0] * 256
+    for i in range(256):
+        c = i << 16
+        for _ in range(8):
+            c = ((c << 1) ^ _CRC_POLY) if (c & 0x800000) else (c << 1)
+        table[i] = c & 0xFFFFFF
+    return tuple(table)
+
+_CRC_TABLE: tuple[int, ...] = _build_crc_table()
+
+def crc_remainder(n: int, length: int) -> int:
+    n_data_bytes = (length - 24) // 8
+    crc = 0
+    shift = length - 8
+    for _ in range(n_data_bytes):
+        byte = (n >> shift) & 0xFF
+        crc = ((crc << 8) & 0xFFFFFF) ^ _CRC_TABLE[((crc >> 16) ^ byte) & 0xFF]
+        shift -= 8
+    parity = n & 0xFFFFFF
+    return (crc ^ parity) & 0xFFFFFF
+
+def is_valid_crc(msg_hex: str) -> bool:
+    try:
+        return crc_remainder(int(msg_hex, 16), len(msg_hex) * 4) == 0
+    except ValueError:
+        return False
+
+def _build_callsign_table() -> str:
+    table = []
+    for i in range(64):
+        if 1 <= i <= 26:
+            table.append(chr(i | 0x40))
+        elif i == 32 or (48 <= i <= 57):
+            table.append(chr(i))
+        else:
+            table.append("#")
+    return "".join(table)
+
+_CALLSIGN_TABLE: str = _build_callsign_table()
+
+def decode_callsign(bits: int) -> str:
+    chars = [_CALLSIGN_TABLE[(bits >> (42 - 6 * i)) & 0x3F] for i in range(8)]
+    return "".join(chars).strip("# ").strip()
+
+def _gray_to_int(gray: int) -> int:
+    num = 0
+    while gray > 0:
+        num ^= gray
+        gray >>= 1
+    return num
+
+def altcode_to_altitude(ac: int) -> Optional[int]:
+    if ac == 0:
+        return None
+    m_bit = (ac >> 6) & 0x1
+    q_bit = (ac >> 4) & 0x1
+    if m_bit == 0 and q_bit == 1:
+        n = ((ac >> 2) & 0x7E0) | ((ac >> 1) & 0x10) | (ac & 0xF)
+        return n * 25 - 1000
+
+    if m_bit == 0 and q_bit == 0:
+        c1 = (ac >> 11) & 1
+        a1 = (ac >> 10) & 1
+        c2 = (ac >> 9) & 1
+        a2 = (ac >> 8) & 1
+        c4 = (ac >> 7) & 1
+        a4 = (ac >> 6) & 1
+        b1 = (ac >> 4) & 1
+        d1 = (ac >> 3) & 1
+        b2 = (ac >> 2) & 1
+        d2 = (ac >> 1) & 1
+        b4 = ac & 1
+        gray_500 = (d2 << 7) | (d1 << 6) | (a4 << 5) | (a2 << 4) | (a1 << 3) | (b4 << 2) | (b2 << 1) | b1
+        gray_100 = (c4 << 2) | (c2 << 1) | c1
+        n_500 = _gray_to_int(gray_500)
+        n_100 = _gray_to_int(gray_100)
+        gillham_map = {0: None, 1: 1, 2: 2, 3: 0, 4: 4, 5: None, 6: 3, 7: None}
+        sub100 = gillham_map.get(n_100)
+        if sub100 is None:
+            return None
+        if n_500 % 2 == 1:
+            sub100 = 4 - sub100
+        return n_500 * 500 + (sub100 - 2) * 100
+    return None
+
+_NL_BOUNDARIES = (
+    10.47047130, 14.82817437, 18.18626357, 21.02939493, 23.54504424,
+    25.82924707, 27.93898710, 29.91135686, 31.77256438, 33.54178436,
+    35.23307598, 36.85817774, 38.42613147, 39.94418609, 41.41846811,
+    42.85399720, 44.25456676, 45.62361714, 46.96427243, 48.27938130,
+    49.57148879, 50.84282380, 52.09540059, 53.33098909, 54.55119701,
+    55.75743407, 56.95093856, 58.13276437, 59.30386827, 60.46507008,
+    61.61706851, 62.76049798, 63.89594048, 65.02394541, 66.14502570,
+    67.25966159, 68.36830508, 69.47137943, 70.56928824, 71.66241086,
+    72.75111166, 73.83573226, 74.91660007, 75.99402508, 77.06829762,
+    78.13969745, 79.20848847, 80.27491972, 81.33922464, 82.40162541,
+    83.46233019, 84.52153024, 85.57940251, 86.63610990, 87.69179979,
+    88.74660785, 89.80066226,
+)
+
+def cpr_nl(lat: float) -> int:
+    lat_abs = abs(lat)
+    if lat_abs >= 87.0:
+        return 1
+    return 59 - bisect_right(_NL_BOUNDARIES, lat_abs)
+
+_CPR_DENOM = 131072.0
+
+def decode_cpr_airborne_local(
+    cpr_format: int, cpr_lat: int, cpr_lon: int, ref_lat: float, ref_lon: float
+) -> Optional[Tuple[float, float]]:
+    d_lat = 360.0 / (59 if cpr_format == 1 else 60)
+    j = floor(ref_lat / d_lat) + floor(0.5 + ((ref_lat % d_lat) / d_lat) - (cpr_lat / _CPR_DENOM))
+    lat = d_lat * (j + (cpr_lat / _CPR_DENOM))
+    if not (-90.0 <= lat <= 90.0):
+        return None
+
+    nl = cpr_nl(lat) - cpr_format
+    if nl > 0:
+        d_lon = 360.0 / nl
+    elif nl == 0:
+        d_lon = 360.0
+    else:
+        return None
+
+    m = floor(ref_lon / d_lon) + floor(0.5 + ((ref_lon % d_lon) / d_lon) - (cpr_lon / _CPR_DENOM))
+    lon = d_lon * (m + (cpr_lon / _CPR_DENOM))
+    lon = (lon + 180.0) % 360.0 - 180.0
+    return round(lat, 5), round(lon, 5)
+
+def decode_cpr_airborne_pair(
+    cpr_lat_even: int, cpr_lon_even: int, cpr_lat_odd: int, cpr_lon_odd: int, even_is_newer: bool
+) -> Optional[Tuple[float, float]]:
+    d_lat_even = 360.0 / 60.0
+    d_lat_odd = 360.0 / 59.0
+    j = floor((59.0 * cpr_lat_even - 60.0 * cpr_lat_odd) / _CPR_DENOM + 0.5)
+    lat_even = d_lat_even * ((j % 60) + cpr_lat_even / _CPR_DENOM)
+    lat_odd = d_lat_odd * ((j % 59) + cpr_lat_odd / _CPR_DENOM)
+    if lat_even >= 270.0:
+        lat_even -= 360.0
+    if lat_odd >= 270.0:
+        lat_odd -= 360.0
+    if not (-90.0 <= lat_even <= 90.0 and -90.0 <= lat_odd <= 90.0):
+        return None
+
+    target_lat = lat_even if even_is_newer else lat_odd
+    nl_even = cpr_nl(lat_even)
+    nl_odd = cpr_nl(lat_odd)
+    if nl_even != nl_odd:
+        return None
+    nl = nl_even
+
+    if nl > 0:
+        if even_is_newer:
+            d_lon = 360.0 / nl
+            m = floor((cpr_lon_even * (nl - 1) - cpr_lon_odd * nl) / _CPR_DENOM + 0.5)
+            lon = d_lon * ((m % nl) + cpr_lon_even / _CPR_DENOM)
+        else:
+            d_lon = 360.0 / max(nl - 1, 1)
+            m = floor((cpr_lon_even * (nl - 1) - cpr_lon_odd * nl) / _CPR_DENOM + 0.5)
+            lon = d_lon * ((m % (nl - 1)) + cpr_lon_odd / _CPR_DENOM)
+    else:
+        return None
+
+    lon = (lon + 180.0) % 360.0 - 180.0
+    return round(target_lat, 5), round(lon, 5)
+
+def calculate_distance_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    r = 6371.0
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlam = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2.0) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlam / 2.0) ** 2
+    return round(r * 2.0 * math.atan2(math.sqrt(a), math.sqrt(1.0 - a)), 2)
+
+def calculate_bearing(lat1: float, lon1: float, lat2: float, lon2: float) -> Tuple[float, str]:
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dlam = math.radians(lon2 - lon1)
+    x = math.sin(dlam) * math.cos(phi2)
+    y = math.cos(phi1) * math.sin(phi2) - math.sin(phi1) * math.cos(phi2) * math.cos(dlam)
+    deg = (math.degrees(math.atan2(x, y)) + 360.0) % 360.0
+    cardinals = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
+    return round(deg, 1), cardinals[int((deg + 22.5) / 45.0) % 8]
+
+def decode_message(hex_str: str) -> dict:
+    hex_str = hex_str.strip().upper()
+    if len(hex_str) != 28:
+        return {}
+    n = int(hex_str, 16)
+    df = (n >> 107) & 0x1F
+    if df not in (17, 18):
+        return {'df': df}
+
+    crc_valid = (crc_remainder(n, 112) == 0)
+    icao = f"{(n >> 80) & 0xFFFFFF:06X}"
+    payload = (n >> 24) & 0xFFFFFFFFFFFFFF
+    tc = (payload >> 51) & 0x1F
+
+    result = {
+        'df': df,
+        'icao': icao,
+        'crc_valid': crc_valid,
+        'typecode': tc
+    }
+
+    # TC 1 - 4: Callsign
+    if 1 <= tc <= 4:
+        cs_bits = payload & 0xFFFFFFFFFFFF
+        result['callsign'] = decode_callsign(cs_bits)
+
+    # TC 9 - 18: Position & Altitude
+    elif 9 <= tc <= 18:
+        ac = (payload >> 36) & 0xFFF
+        cpr_fmt = (payload >> 34) & 0x1
+        cpr_lat = (payload >> 17) & 0x1FFFF
+        cpr_lon = payload & 0x1FFFF
+        altcode = ((ac >> 6) << 7) | (ac & 0x3F)
+        result['altitude'] = altcode_to_altitude(altcode)
+        result['cpr_format'] = cpr_fmt
+        result['cpr_lat'] = cpr_lat
+        result['cpr_lon'] = cpr_lon
+
+    # TC 19: Velocity
+    elif tc == 19:
+        subtype = (payload >> 48) & 0x7
+        if subtype in (1, 2):
+            v_ew_sign = (payload >> 42) & 0x1
+            v_ew_mag = (payload >> 32) & 0x3FF
+            v_ns_sign = (payload >> 31) & 0x1
+            v_ns_mag = (payload >> 21) & 0x3FF
+            if v_ew_mag > 0 and v_ns_mag > 0:
+                mult = 4 if subtype == 2 else 1
+                v_ew = (v_ew_mag - 1) * mult
+                v_ns = (v_ns_mag - 1) * mult
+                v_we = -v_ew if v_ew_sign == 1 else v_ew
+                v_sn = -v_ns if v_ns_sign == 1 else v_ns
+                result['groundspeed'] = int(math.sqrt(v_we * v_we + v_sn * v_sn))
+                trk = math.degrees(math.atan2(v_we, v_sn))
+                result['track'] = (trk + 360.0) % 360.0
+        elif subtype in (3, 4):
+            hdg_status = (payload >> 42) & 0x1
+            hdg_raw = (payload >> 32) & 0x3FF
+            as_mag = (payload >> 21) & 0x3FF
+            if hdg_status == 1:
+                result['track'] = hdg_raw / 1024.0 * 360.0
+            if as_mag > 0:
+                result['groundspeed'] = (as_mag - 1) * (4 if subtype == 4 else 1)
+
+        vr_sign = (payload >> 19) & 0x1
+        vr_mag = (payload >> 10) & 0x1FF
+        if vr_mag > 0:
+            result['vertical_rate'] = (vr_mag - 1) * 64 * (-1 if vr_sign == 1 else 1)
+
+    return result
+
+# ============================================================================
+# SECTION 3: UDP Broadcaster & Client Networking
+# ============================================================================
+
+class UdpBroadcaster:
+    """Manages outgoing UDP transmission to unicast or subnet broadcast."""
+
+    def __init__(self, host: str = "127.0.0.1", port: int = 5005, broadcast: bool = False):
+        self.host = "255.255.255.255" if broadcast and host in ("127.0.0.1", "0.0.0.0") else host
+        self.port = port
+        self.broadcast = broadcast
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        if self.broadcast:
+            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        self.packets_sent = 0
+        self.bytes_sent = 0
+        self.lock = threading.Lock()
+
+    def send_line(self, line: str):
+        if not line:
+            return
+        data = (line.strip() + "\n").encode("utf-8", errors="replace")
+        with self.lock:
+            try:
+                self.sock.sendto(data, (self.host, self.port))
+                self.packets_sent += 1
+                self.bytes_sent += len(data)
+            except Exception as e:
+                print(f"[ERROR] UDP send failed: {e}")
+
+    def close(self):
+        try:
+            self.sock.close()
+        except Exception:
+            pass
+
+
+class UdpAdsbClient:
+    """Standalone UDP ADS-B Decoder Client for streaming & headless decoding."""
+
+    def __init__(
+        self,
+        host: str = "0.0.0.0",
+        port: int = 5005,
+        observer_lat: Optional[float] = None,
+        observer_lon: Optional[float] = None,
+        timeout: Optional[float] = 0.5
+    ):
+        self.host = host
+        self.port = port
+        self.observer_lat = observer_lat
+        self.observer_lon = observer_lon
+        self.timeout = timeout
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.bind((self.host, self.port))
+        if self.timeout:
+            self.sock.settimeout(self.timeout)
+        self.aircraft_history: Dict[str, Dict[str, Any]] = {}
+
+    def listen(self) -> Generator[Dict[str, Any], None, None]:
+        while True:
+            try:
+                data, _ = self.sock.recvfrom(4096)
+                text = data.decode("utf-8", errors="ignore")
+                for line in text.splitlines():
+                    hex_msg, rssi = parse_raw_line(line)
+                    if hex_msg:
+                        dec = decode_message(hex_msg)
+                        if dec and dec.get('crc_valid'):
+                            icao = dec.get('icao')
+                            now = time.time()
+                            if icao not in self.aircraft_history:
+                                self.aircraft_history[icao] = {
+                                    'icao': icao, 'callsign': None, 'altitude': None,
+                                    'speed': None, 'heading': None, 'latitude': None,
+                                    'longitude': None, 'distance_km': None, 'last_seen': now
+                                }
+                            entry = self.aircraft_history[icao]
+                            entry['last_seen'] = now
+                            if 'callsign' in dec:
+                                entry['callsign'] = dec['callsign'].strip('_ ')
+                            if 'altitude' in dec and dec['altitude'] is not None:
+                                entry['altitude'] = dec['altitude']
+                            if 'groundspeed' in dec and dec['groundspeed'] is not None:
+                                entry['speed'] = dec['groundspeed']
+                            if 'track' in dec and dec['track'] is not None:
+                                entry['heading'] = dec['track']
+
+                            # Position
+                            if 'cpr_lat' in dec and 'cpr_lon' in dec:
+                                cpr_fmt = dec['cpr_format']
+                                cpr_lat = dec['cpr_lat']
+                                cpr_lon = dec['cpr_lon']
+                                if self.observer_lat and self.observer_lon:
+                                    pos = decode_cpr_airborne_local(
+                                        cpr_fmt, cpr_lat, cpr_lon,
+                                        entry['latitude'] or self.observer_lat,
+                                        entry['longitude'] or self.observer_lon
+                                    )
+                                    if pos:
+                                        entry['latitude'], entry['longitude'] = pos
+                                        entry['distance_km'] = calculate_distance_km(
+                                            self.observer_lat, self.observer_lon, pos[0], pos[1]
+                                        )
+
+                            if rssi is not None:
+                                entry['rssi'] = rssi
+                            yield entry
+            except socket.timeout:
+                continue
+            except (KeyboardInterrupt, SystemExit):
+                break
+
+    def close(self):
+        try:
+            self.sock.close()
+        except Exception:
+            pass
+
+# ============================================================================
+# SECTION 4: Aircraft Telemetry Tracker Store
 # ============================================================================
 
 class RadarTracker:
@@ -175,8 +569,8 @@ class RadarTracker:
             self.total_msgs += 1
             self.update_message_rate(now)
 
-        dec = decoder.decode_message(msg_hex)
-        if not dec:
+        dec = decode_message(msg_hex)
+        if not dec or not dec.get('crc_valid'):
             return
 
         icao = dec.get('icao')
@@ -217,14 +611,14 @@ class RadarTracker:
             if rssi is not None:
                 ac['last_rssi'] = rssi
 
-            # 1. Identification & Callsign
+            # 1. Callsign
             if 'callsign' in dec and dec['callsign']:
                 cs = dec['callsign'].strip('_ ')
                 if cs and ac['callsign'] != cs:
                     ac['callsign'] = cs
                     self.log_event(f"ICAO {icao} Callsign: {cs}")
 
-            # 2. Airborne Position & Altitude (CPR)
+            # 2. Position & Altitude
             if tc and 9 <= tc <= 18:
                 alt = dec.get('altitude')
                 if alt is not None:
@@ -235,16 +629,14 @@ class RadarTracker:
                 cpr_lon = dec.get('cpr_lon')
 
                 pos = None
-                # Mode A: Single-frame Local CPR if observer position is configured
                 if self.has_observer and cpr_fmt in (0, 1) and cpr_lat is not None and cpr_lon is not None:
                     try:
                         ref_lat = ac['lat'] if ac['lat'] is not None else self.observer_lat
                         ref_lon = ac['lon'] if ac['lon'] is not None else self.observer_lon
-                        pos = decoder.decode_cpr_airborne_local(cpr_fmt, cpr_lat, cpr_lon, ref_lat, ref_lon)
+                        pos = decode_cpr_airborne_local(cpr_fmt, cpr_lat, cpr_lon, ref_lat, ref_lon)
                     except Exception:
                         pos = None
 
-                # Mode B: Global CPR Pair (works with or without observer)
                 if cpr_fmt == 0:
                     ac['cpr_even'] = (cpr_lat, cpr_lon, now)
                 elif cpr_fmt == 1:
@@ -255,7 +647,7 @@ class RadarTracker:
                     lat_o, lon_o, t_o = ac['cpr_odd']
                     if abs(t_e - t_o) <= self.cpr_max_interval:
                         try:
-                            pos = decoder.decode_cpr_airborne_pair(
+                            pos = decode_cpr_airborne_pair(
                                 lat_e, lon_e, lat_o, lon_o, even_is_newer=(t_e >= t_o)
                             )
                         except Exception:
@@ -268,10 +660,10 @@ class RadarTracker:
                     ac['lon'] = lon
 
                     if self.has_observer:
-                        dist_km = decoder.calculate_distance_km(self.observer_lat, self.observer_lon, lat, lon)
+                        dist_km = calculate_distance_km(self.observer_lat, self.observer_lon, lat, lon)
                         ac['dist_km'] = dist_km
                         ac['dist_nm'] = dist_km / 1.852
-                        b_deg, b_card = decoder.calculate_bearing(self.observer_lat, self.observer_lon, lat, lon)
+                        b_deg, b_card = calculate_bearing(self.observer_lat, self.observer_lon, lat, lon)
                         ac['bearing_deg'] = b_deg
                         ac['bearing_cardinal'] = b_card
                         if first_fix:
@@ -280,7 +672,7 @@ class RadarTracker:
                         if first_fix:
                             self.log_event(f"ICAO {icao} Global Position solved: {lat:.4f}, {lon:.4f}")
 
-            # 3. Velocity & Heading
+            # 3. Velocity
             elif tc == 19:
                 spd = dec.get('groundspeed')
                 trk = dec.get('track')
@@ -305,13 +697,8 @@ class RadarTracker:
         return len(to_remove)
 
 # ============================================================================
-# Dashboard Renderers
+# SECTION 5: Terminal Dashboard Renderers (Rich & Pure-ANSI)
 # ============================================================================
-
-def get_heading_arrow(deg: float) -> str:
-    arrows = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW']
-    idx = int((deg + 22.5) / 45.0) % 8
-    return arrows[idx]
 
 def render_rich_view(tracker: RadarTracker, port_info: str):
     tracker.prune_stale_aircraft()
@@ -373,15 +760,8 @@ def render_rich_view(tracker: RadarTracker, port_info: str):
 
     if not aircraft_list:
         idle_row = [
-            "[dim]IDLE[/]",
-            "------",
-            "------",
-            "[dim]---[/]",
-            "[dim]---[/]",
-            "[dim]Searching for aircraft in range...[/]",
-            "---",
-            "---",
-            "0"
+            "[dim]IDLE[/]", "------", "------", "[dim]---[/]", "[dim]---[/]",
+            "[dim]Searching for aircraft in range...[/]", "---", "---", "0"
         ]
         if has_obs:
             idle_row.insert(6, "---")
@@ -424,24 +804,12 @@ def render_rich_view(tracker: RadarTracker, port_info: str):
             else:
                 rssi_str = "[dim]---[/]"
 
-            row_items = [
-                status,
-                icao,
-                callsign,
-                alt_str,
-                spd_str,
-                coord_str
-            ]
+            row_items = [status, icao, callsign, alt_str, spd_str, coord_str]
             if has_obs:
                 dist_str = f"[bold magenta]{ac['dist_km']:.1f} km[/] [yellow]{ac['bearing_cardinal']}[/]" if ac['dist_km'] else "[dim]---[/]"
                 row_items.append(dist_str)
 
-            row_items.extend([
-                rssi_str,
-                f"{age:.1f}s",
-                str(ac['msg_count'])
-            ])
-
+            row_items.extend([rssi_str, f"{age:.1f}s", str(ac['msg_count'])])
             table.add_row(*row_items)
 
     log_renderables = [Text(ev) for ev in events] if events else [Text("Listening on 1090 MHz. Place antenna near window for best reception.", style="dim")]
@@ -449,7 +817,6 @@ def render_rich_view(tracker: RadarTracker, port_info: str):
     return Group(header_panel, table, log_panel)
 
 def render_ansi_fallback(tracker: RadarTracker, port_info: str):
-    """Pure-Python terminal rendering when 'rich' is not installed."""
     tracker.prune_stale_aircraft()
     now = time.time()
 
@@ -468,8 +835,7 @@ def render_ansi_fallback(tracker: RadarTracker, port_info: str):
 
     obs_str = f"Observer: ({tracker.observer_lat:.4f}, {tracker.observer_lon:.4f})" if has_obs else "Observer: Not Configured"
 
-    out = ["\033[H"]
-    out.append("=" * 96)
+    out = ["\033[H", "=" * 96]
     out.append(f" ADS-B RADAR  [{conn_status}]  Source: {port_info} | {obs_str}")
     out.append(f" Active: {active_count} | Rate: {msg_rate} msg/s | Decoded: {total_msgs} | Packets: {raw_packets} | Prune: {int(tracker.prune_timeout)}s")
     out.append("=" * 96)
@@ -514,7 +880,7 @@ def render_ansi_fallback(tracker: RadarTracker, port_info: str):
     sys.stdout.flush()
 
 # ============================================================================
-# Background Threads (Serial / Playback / UDP)
+# SECTION 6: Background Worker Threads
 # ============================================================================
 
 def udp_reader_worker(
@@ -522,7 +888,7 @@ def udp_reader_worker(
     port: int,
     tracker: RadarTracker,
     stop_event: threading.Event,
-    save_file: str | None = None
+    save_file: Optional[str] = None
 ):
     tracker.status_message = f"Binding UDP {host}:{port}..."
     try:
@@ -577,8 +943,8 @@ def serial_reader_worker(
     timeout: float,
     tracker: RadarTracker,
     stop_event: threading.Event,
-    save_file: str | None,
-    udp_forward: tuple[socket.socket, tuple[str, int]] | None = None
+    save_file: Optional[str],
+    broadcaster: Optional[UdpBroadcaster] = None
 ):
     tracker.status_message = f"Connecting to {port}..."
     try:
@@ -624,11 +990,8 @@ def serial_reader_worker(
                                     f_save.write(f"[{ts_full}] {raw_line}\n")
                                     f_save.flush()
 
-                                if udp_forward:
-                                    try:
-                                        udp_forward[0].sendto((raw_line + "\n").encode('utf-8', errors='replace'), udp_forward[1])
-                                    except Exception:
-                                        pass
+                                if broadcaster:
+                                    broadcaster.send_line(raw_line)
 
                                 tracker.process_raw_line(raw_line)
                     else:
@@ -645,7 +1008,7 @@ def file_reader_worker(
     tracker: RadarTracker,
     stop_event: threading.Event,
     speed: float = 1.0,
-    udp_forward: tuple[socket.socket, tuple[str, int]] | None = None
+    broadcaster: Optional[UdpBroadcaster] = None
 ):
     if not os.path.exists(file_path):
         tracker.status_message = f"File Not Found: {file_path}"
@@ -669,11 +1032,8 @@ def file_reader_worker(
             line_clean = line.strip()
             if line_clean:
                 tracker.total_raw_packets += 1
-                if udp_forward:
-                    try:
-                        udp_forward[0].sendto((line_clean + "\n").encode('utf-8', errors='replace'), udp_forward[1])
-                    except Exception:
-                        pass
+                if broadcaster:
+                    broadcaster.send_line(line_clean)
                 tracker.process_raw_line(line_clean)
 
             if delay > 0:
@@ -682,34 +1042,41 @@ def file_reader_worker(
         time.sleep(1.0)
 
 # ============================================================================
-# Main Entry Point
+# SECTION 7: Main Entrypoint & Mode Dispatcher
 # ============================================================================
 
 def main():
     config = load_config()
+    serial_cfg = config.get('serial', {})
+    udp_cfg = config.get('udp', {})
 
-    parser = argparse.ArgumentParser(description="Live ADS-B Terminal Radar")
-    parser.add_argument('--port', help=f"Serial port (default from config: {config['serial']['port']})")
-    parser.add_argument('--baud', type=int, help=f"Baud rate (default from config: {config['serial']['baudrate']})")
+    parser = argparse.ArgumentParser(description="Micro ADS-B Terminal Radar & Telemetry Suite (1090 MHz)")
+    parser.add_argument('--port', help=f"Serial port (default: {serial_cfg.get('port', 'COM12')})")
+    parser.add_argument('--baud', type=int, help=f"Baud rate (default: {serial_cfg.get('baudrate', 115200)})")
     parser.add_argument('--file', help="Replay messages from a recorded file")
     parser.add_argument('--demo', action='store_true', help="Run demo mode using bundled sample flight")
-    parser.add_argument('--save', help="Save incoming serial traffic to file")
+    parser.add_argument('--record', '--save', dest='save', help="Record incoming raw traffic to file")
     parser.add_argument('--lat', type=float, help="Override observer latitude")
     parser.add_argument('--lon', type=float, help="Override observer longitude")
     parser.add_argument('--no-observer', action='store_true', help="Disable observer coordinates (Global CPR mode)")
     parser.add_argument('--speed', type=float, default=2.0, help="Replay speed multiplier (default: 2.0)")
 
-    # UDP Arguments
-    parser.add_argument('--udp', nargs='?', const=5005, type=int, help="Receive ADS-B datagrams over UDP port (default: 5005)")
-    parser.add_argument('--udp-host', default="0.0.0.0", help="UDP bind host when receiving via UDP (default: 0.0.0.0)")
+    # UDP Options
+    parser.add_argument('--udp', nargs='?', const=udp_cfg.get('listen_port', 5005), type=int, help="Receive ADS-B over UDP port (default: 5005)")
+    parser.add_argument('--udp-host', default=udp_cfg.get('listen_host', '0.0.0.0'), help="UDP bind host (default: 0.0.0.0)")
+    parser.add_argument('--server-udp', nargs='?', const=udp_cfg.get('target_port', 5005), type=int, help="Run as standalone UDP server / broadcaster on port")
     parser.add_argument('--forward-udp', help="Forward received packets to UDP target host:port (e.g. 127.0.0.1:5005)")
+    parser.add_argument('--broadcast', action='store_true', default=udp_cfg.get('broadcast', False), help="Enable UDP subnet broadcast")
+
+    # Headless / Output Options
+    parser.add_argument('--headless', action='store_true', help="Run in headless CLI mode without terminal radar GUI")
+    parser.add_argument('--json', action='store_true', help="Output decoded telemetry as JSON lines (NDJSON)")
 
     args = parser.parse_args()
 
-    # Apply command-line overrides
-    port = args.port or config['serial']['port']
-    baud = args.baud or config['serial']['baudrate']
-    timeout = config['serial'].get('timeout', 0.2)
+    port = args.port or serial_cfg.get('port', 'COM12')
+    baud = args.baud or serial_cfg.get('baudrate', 115200)
+    timeout = serial_cfg.get('timeout', 0.2)
 
     if args.no_observer:
         config['observer']['enabled'] = False
@@ -720,27 +1087,69 @@ def main():
 
     save_file = args.save or (config['logging']['raw_traffic_file'] if config['logging'].get('save_raw_traffic') else None)
 
+    # ------------------------------------------------------------------------
+    # Sub-Mode A: Headless UDP Client Streamer
+    # ------------------------------------------------------------------------
+    if args.headless and args.udp:
+        obs_lat = config['observer']['latitude'] if config['observer']['enabled'] else None
+        obs_lon = config['observer']['longitude'] if config['observer']['enabled'] else None
+        print(f"[*] Starting Headless UDP Client on {args.udp_host}:{args.udp}")
+        client = UdpAdsbClient(host=args.udp_host, port=args.udp, observer_lat=obs_lat, observer_lon=obs_lon)
+        try:
+            for ac in client.listen():
+                if args.json:
+                    print(json.dumps(ac, default=str))
+                else:
+                    ts = datetime.now().strftime("%H:%M:%S")
+                    print(f"[{ts}] ICAO: {ac['icao']} | CALL: {ac.get('callsign') or '----':<8} | ALT: {ac.get('altitude') or '----'} | POS: ({ac.get('latitude')}, {ac.get('longitude')})")
+        except KeyboardInterrupt:
+            print("\n[*] Stopped UDP client.")
+        finally:
+            client.close()
+        return
+
+    # ------------------------------------------------------------------------
+    # Sub-Mode B: Standalone UDP Server / Broadcaster
+    # ------------------------------------------------------------------------
+    if args.server_udp:
+        target_port = args.server_udp
+        target_host = "255.255.255.255" if args.broadcast else udp_cfg.get('target_host', '127.0.0.1')
+        broadcaster = UdpBroadcaster(host=target_host, port=target_port, broadcast=args.broadcast)
+        stop_event = threading.Event()
+        target_file = os.path.join(os.path.dirname(__file__), 'sample_flight.txt') if args.demo else args.file
+        dummy_tracker = RadarTracker(config)
+
+        print(f"[*] ADS-B UDP Server broadcasting to {target_host}:{target_port} (Broadcast: {args.broadcast})")
+        try:
+            if target_file:
+                file_reader_worker(target_file, dummy_tracker, stop_event, speed=args.speed, broadcaster=broadcaster)
+            else:
+                serial_reader_worker(port, baud, timeout, dummy_tracker, stop_event, save_file, broadcaster=broadcaster)
+        except KeyboardInterrupt:
+            print("\n[*] Stopping UDP server...")
+            stop_event.set()
+        finally:
+            broadcaster.close()
+        return
+
+    # ------------------------------------------------------------------------
+    # Sub-Mode C: Visual Terminal Radar (Serial, UDP, or Replay)
+    # ------------------------------------------------------------------------
     tracker = RadarTracker(config)
     stop_event = threading.Event()
 
-    # Optional UDP Forwarding Socket
-    udp_fwd_tuple = None
+    # Optional Broadcaster for UDP Forwarding
+    broadcaster = None
     if args.forward_udp:
-        try:
-            parts = args.forward_udp.split(':')
-            fwd_host = parts[0]
-            fwd_port = int(parts[1]) if len(parts) > 1 else 5005
-            fwd_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            udp_fwd_tuple = (fwd_sock, (fwd_host, fwd_port))
-            tracker.log_event(f"UDP forwarding active to {fwd_host}:{fwd_port}")
-        except Exception as e:
-            print(f"[WARNING] Invalid --forward-udp format: {e}")
+        parts = args.forward_udp.split(':')
+        fwd_host = parts[0]
+        fwd_port = int(parts[1]) if len(parts) > 1 else 5005
+        broadcaster = UdpBroadcaster(host=fwd_host, port=fwd_port, broadcast=args.broadcast)
+        tracker.log_event(f"UDP forward active to {fwd_host}:{fwd_port}")
 
     target_file = None
     if args.demo:
         demo_candidate = os.path.join(os.path.dirname(__file__), 'sample_flight.txt')
-        if not os.path.exists(demo_candidate):
-            demo_candidate = os.path.join(os.path.dirname(__file__), 'serial_dump.txt')
         target_file = demo_candidate
     elif args.file:
         target_file = args.file
@@ -756,14 +1165,14 @@ def main():
         source_info = f"Demo ({os.path.basename(target_file)})"
         reader = threading.Thread(
             target=file_reader_worker,
-            args=(target_file, tracker, stop_event, args.speed, udp_fwd_tuple),
+            args=(target_file, tracker, stop_event, args.speed, broadcaster),
             daemon=True
         )
     else:
         source_info = f"{port} @ {baud}"
         reader = threading.Thread(
             target=serial_reader_worker,
-            args=(port, baud, timeout, tracker, stop_event, save_file, udp_fwd_tuple),
+            args=(port, baud, timeout, tracker, stop_event, save_file, broadcaster),
             daemon=True
         )
 
@@ -780,11 +1189,8 @@ def main():
             pass
         finally:
             stop_event.set()
-            if udp_fwd_tuple:
-                try:
-                    udp_fwd_tuple[0].close()
-                except Exception:
-                    pass
+            if broadcaster:
+                broadcaster.close()
             reader.join(timeout=1.0)
             console.print("\n[bold yellow]Radar tracker stopped.[/]")
     else:
@@ -797,11 +1203,8 @@ def main():
             pass
         finally:
             stop_event.set()
-            if udp_fwd_tuple:
-                try:
-                    udp_fwd_tuple[0].close()
-                except Exception:
-                    pass
+            if broadcaster:
+                broadcaster.close()
             reader.join(timeout=1.0)
             print("\nRadar tracker stopped.")
 
