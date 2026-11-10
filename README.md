@@ -3,7 +3,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![GitHub](https://img.shields.io/badge/GitHub-israelxss%2Fmicro--adsb--radar-green)](https://github.com/israelxss/micro-adsb-radar)
 
-An ultra-compact, all-in-one pure Python ADS-B and Mode-S receiver, live terminal flight radar, and UDP network streaming suite. 
+An ultra-compact, all-in-one pure Python ADS-B and Mode-S receiver, live terminal flight radar, and UDP network streaming suite with offline aircraft metadata resolution. 
 Repository: [https://github.com/israelxss/micro-adsb-radar](https://github.com/israelxss/micro-adsb-radar) 
 
 The entire codebase is consolidated into a **single self-contained script (`main.py`)** with **zero dependency on `pyModeS`** or any heavy SDR framework. It relies solely on **`pyserial`** for serial communications and Python's built-in standard library.
@@ -52,6 +52,11 @@ Connect the module to your 3.3V FTDI / USB-UART bridge as follows:
 
 * **All-in-One Consolidated Architecture:** Complete decoder engine, terminal radar, UDP server, UDP client, recorder, and log replayer unified inside [`main.py`](main.py).
 * **Zero External Decoding Dependencies:** Built-in pure-Python Mode-S CRC-24 error validation, ICAO 6-bit callsign parsing, 25-ft & 100-ft Gillham altitude decoders, velocity/heading calculation, and Compact Position Reporting (CPR).
+* **Offline Aircraft Metadata & Country Resolution:**
+  * **100% Offline Operation:** No internet connection or remote API calls required during runtime.
+  * **Built-in ICAO Allocation Table:** Instantly maps every 24-bit ICAO address to its country of registration and national tail prefix (e.g. `4X`, `N`, `G`, `TC`, `5B`).
+  * **Bundled Starter Database (`aircraft_db.csv`):** Resolves registration tail numbers, ICAO aircraft types (e.g. `B789`, `A320`), model descriptions, and airline operators.
+  * **Auto-Discovery of Global Databases:** Automatically loads external global databases (`aircraft.csv.gz` or `aircraftDatabase.csv`) if placed in the folder.
 * **Dual CPR Positioning Engine:**
   * **Local Single-Frame CPR:** Instant latitude/longitude decoding from the very first frame using observer location as a reference.
   * **Global CPR (No Observer Required):** Automatically resolves aircraft positions without requiring observer coordinates by pairing Even and Odd frames.
@@ -62,6 +67,31 @@ Connect the module to your 3.3V FTDI / USB-UART bridge as follows:
 * **Auto-Pruning Inactive Aircraft:** Automatically drops stale aircraft that haven't transmitted for 30 seconds.
 * **Rich Terminal UI with Fallback:** Beautiful real-time dashboard powered by `rich` (if installed) with an automatic pure-Python ANSI fallback.
 * **Configurable:** Centralized `config.json` file for serial port, observer location, timeouts, and network settings.
+
+---
+
+## 🗄️ Offline Aircraft Metadata Databases
+
+The radar system resolves aircraft metadata **100% offline** (zero internet latency, no web scraping, and no images—purely fast text information):
+
+1. **Bundled Database (`aircraft_db.csv`):**  
+   Shipped directly with this repository, containing key commercial airliners, regional jets, and regional operators.
+2. **Official ICAO Country Prefix Resolver:**  
+   Built directly into `main.py`, mapping any hex code to its country of origin (e.g. `738...` -> Israel, `A00...` -> United States, `4B8...` -> Turkey).
+
+### Where to Download Full Global Offline Databases
+If you want complete coverage of 500,000+ aircraft worldwide, download either of the standard open-source databases below and place the file directly in the repository directory. `main.py` will automatically detect and load it on startup:
+
+* **tar1090 / readsb Aircraft Database (Recommended):**  
+  Maintained by `wiedehopf` and `Mictronics`. Compressed CSV updated regularly.  
+  * **Direct Download URL:** [https://github.com/wiedehopf/tar1090-db/raw/csv/aircraft.csv.gz](https://github.com/wiedehopf/tar1090-db/raw/csv/aircraft.csv.gz)  
+  * **Command to download:**
+    ```bash
+    curl -L -o aircraft.csv.gz https://github.com/wiedehopf/tar1090-db/raw/csv/aircraft.csv.gz
+    ```
+* **OpenSky Network Aircraft Metadata:**  
+  * **Download URL:** [https://opensky-network.org/datasets/metadata/aircraft-database.csv](https://opensky-network.org/datasets/metadata/aircraft-database.csv)  
+  * Or zipped archive: [https://s3.opensky-network.org/data-samples/metadata/aircraftDatabase.zip](https://s3.opensky-network.org/data-samples/metadata/aircraftDatabase.zip)
 
 ---
 
@@ -195,18 +225,18 @@ python main.py --file sample_flight.txt --speed 1.0
 ```
 
 ### 7. Programmatic Python Import
-You can import the decoder and UDP classes directly into your own scripts:
+You can import the decoder, database, and UDP classes directly into your own scripts:
 ```python
-from main import decode_message, UdpAdsbClient
+from main import decode_message, AircraftMetadataDB, UdpAdsbClient
+
+# Look up offline aircraft metadata
+db = AircraftMetadataDB()
+print(db.lookup("738485"))
+# Output: {'reg': '4X-EDA', 'type': 'B789', 'model': 'Boeing 787-9 Dreamliner', 'operator': 'El Al Israel Airlines', 'country': 'Israel', 'country_prefix': '4X'}
 
 # Decode single raw Mode-S squitter hex
 telemetry = decode_message("8D4520D2EA07E8AED73C0846B0A5")
 print(telemetry)
-
-# Stream decoded flights from UDP
-client = UdpAdsbClient(port=5005, observer_lat=51.4700, observer_lon=-0.4543)
-for aircraft in client.listen():
-    print(aircraft)
 ```
 
 ---
@@ -216,21 +246,21 @@ for aircraft in client.listen():
 *(The sample table below uses synthetic / fictional flight data for privacy protection)*
 
 ```text
-╭──────────────────────────────────────────────────────────────────────────────╮
-│  ADS-B RADAR   [ONLINE (Listening 1090MHz)] Port: COM12 @ 115200 |           │
-│ Observer: (51.4700, -0.4543)                                                 │
-│ ⠴ Active: 1 | Rate: 5 msg/s | Decoded: 42 | Packets: 42 | Prune: 30s        │
-╰──────────────────────────────────────────────────────────────────────────────╯
-╭──────┬───────┬────────┬──────────────┬─────────────┬─────────────┬────────────┬─────────┬──────┬──────╮
-│ STAT │ ICAO  │ CALL   │ ALTITUDE(V/S)│ SPEED & HDG │ COORDINATES │ RANGE & BRG│ RSSI    │ SEEN │ MSGS │
-├──────┼───────┼────────┼──────────────┼─────────────┼─────────────┼────────────┼─────────┼──────┼──────┤
-│ LIVE │ 4840D6│ KLM1023│ 6,500ft(-850)│ 260kts @ 095│ 51.505,-0.12│ 24.5km (E) │ -98 dBm │ 0.8s │   42 │
-╰──────┴───────┴────────┴──────────────┴─────────────┴─────────────┴────────────┴─────────┴──────┴──────╯
-╭─────────────────────────── Radio Activity Feed ──────────────────────────────╮
-│ [14:22:05] NEW AIRCRAFT: ICAO 4840D6 (RSSI: -98 dBm)                         │
-│ [14:22:06] ICAO 4840D6 Callsign: KLM1023                                     │
-│ [14:22:08] ICAO 4840D6 Position solved: 24.5 km away (E)                     │
-╰──────────────────────────────────────────────────────────────────────────────╯
+╭─────────────────────────────────────────────────────────────────────────────────────────────╮
+│  ADS-B RADAR   [ONLINE (Listening 1090MHz)] Port: COM12 @ 115200 |                          │
+│ Observer: (51.4700, -0.4543)                                                                │
+│ ⠴ Active: 1 | Rate: 5 msg/s | Decoded: 42 | Packets: 42 | DB: 99 airframes | Prune: 30s     │
+╰─────────────────────────────────────────────────────────────────────────────────────────────╯
+╭──────┬───────┬────────┬──────────────┬──────────────┬─────────────┬─────────────┬────────────┬─────────┬──────┬──────╮
+│ STAT │ ICAO  │ CALL   │ REG / TYPE   │ ALTITUDE(V/S)│ SPEED & HDG │ COORDINATES │ RANGE & BRG│ RSSI    │ SEEN │ MSGS │
+├──────┼───────┼────────┼──────────────┼──────────────┼─────────────┼─────────────┼────────────┼─────────┼──────┼──────┤
+│ LIVE │ 4840D6│ KLM1023│ PH-BXO (B738)│ 6,500ft(-850)│ 260kts @ 095│ 51.505,-0.12│ 24.5km (E) │ -98 dBm │ 0.8s │   42 │
+╰──────┴───────┴────────┴──────────────┴──────────────┴─────────────┴─────────────┴────────────┴─────────┴──────┴──────╯
+╭─────────────────────────────────── Radio Activity Feed ─────────────────────────────────────╮
+│ [14:22:05] NEW AIRCRAFT: ICAO 4840D6 PH-BXO (B738) - KLM Royal Dutch Airlines (RSSI: -98dBm)│
+│ [14:22:06] ICAO 4840D6 Callsign: KLM1023 (PH-BXO B738)                                      │
+│ [14:22:08] ICAO 4840D6 (PH-BXO) Position solved: 24.5 km away (E)                           │
+╰─────────────────────────────────────────────────────────────────────────────────────────────╯
 ```
 
 ---
@@ -253,6 +283,7 @@ micro-adsb-radar/
 ├── .gitignore          # Git ignore rules (caches, virtual environments, logs)
 ├── LICENSE             # MIT open-source license
 ├── README.md           # Documentation and hardware setup guide
+├── aircraft_db.csv     # Bundled offline aircraft metadata database (reg, type, operator)
 ├── config.json         # Centralized configuration (serial, observer, UDP, radar)
 ├── main.py             # All-in-one ADS-B suite (decoder, radar, UDP server/client, recorder)
 └── sample_flight.txt   # Flight data sample for offline testing & demo

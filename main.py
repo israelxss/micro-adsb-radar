@@ -3,16 +3,19 @@
 Micro ADS-B Radar & Telemetry Suite (1090 MHz)
 All-in-one pure Python ADS-B / Mode-S system:
   1. Complete Pure-Python Decoding Engine (Zero pyModeS dependency)
-  2. Live Terminal Radar Dashboard (Rich UI + ANSI fallback)
-  3. UDP Server / Broadcaster (Unicast & Subnet Broadcast)
-  4. UDP Client & Headless JSON Streamer
-  5. Raw Traffic Recorder & Log Replay Simulator
+  2. Offline Aircraft Metadata Database & ICAO Country Resolver
+  3. Live Terminal Radar Dashboard (Rich UI + ANSI fallback)
+  4. UDP Server / Broadcaster (Unicast & Subnet Broadcast)
+  5. UDP Client & Headless JSON Streamer
+  6. Raw Traffic Recorder & Log Replay Simulator
 Only requires 'pyserial' for hardware serial communications.
 """
 
 import sys
 import os
 import re
+import csv
+import gzip
 import json
 import time
 import math
@@ -75,8 +78,8 @@ def load_config() -> dict:
         },
         "observer": {
             "enabled": True,
-            "latitude": 51.4700,
-            "longitude": -0.4543
+            "latitude": 31.9830,
+            "longitude": 34.7818
         },
         "radar": {
             "prune_timeout_seconds": 30.0,
@@ -129,7 +132,173 @@ def parse_raw_line(line: str) -> Tuple[Optional[str], Optional[int]]:
     return None, None
 
 # ============================================================================
-# SECTION 2: Pure-Python ADS-B / Mode-S Decoding Engine
+# SECTION 2: Offline Aircraft Metadata Database & Country Allocation
+# ============================================================================
+
+_ICAO_COUNTRY_RANGES = (
+    (0x738000, 0x738FFF, "Israel", "4X"),
+    (0xA00000, 0xAFFFFF, "United States", "N"),
+    (0x400000, 0x43FFFF, "United Kingdom", "G"),
+    (0x380000, 0x3BFFFF, "France", "F"),
+    (0x3C0000, 0x3FFFFF, "Germany", "D"),
+    (0x300000, 0x33FFFF, "Italy", "I"),
+    (0x4B8000, 0x4BFFFF, "Turkey", "TC"),
+    (0x468000, 0x46FFFF, "Greece", "SX"),
+    (0x4C8000, 0x4CFFFF, "Cyprus", "5B"),
+    (0x440000, 0x447FFF, "Austria", "OE"),
+    (0x4B0000, 0x4B7FFF, "Switzerland", "HB"),
+    (0x480000, 0x487FFF, "Netherlands", "PH"),
+    (0x448000, 0x44FFFF, "Belgium", "OO"),
+    (0x4CA000, 0x4CAFFF, "Ireland", "EI"),
+    (0x470000, 0x477FFF, "Hungary", "HA"),
+    (0x4D2000, 0x4D2FFF, "Malta", "9H"),
+    (0x4A0000, 0x4A7FFF, "Romania", "YR"),
+    (0x896000, 0x896FFF, "United Arab Emirates", "A6"),
+    (0x750000, 0x750FFF, "Jordan", "JY"),
+    (0x010000, 0x017FFF, "Egypt", "SU"),
+    (0x140000, 0x15FFFF, "Russia", "RA"),
+    (0x508000, 0x50FFFF, "Ukraine", "UR"),
+    (0x760000, 0x767FFF, "Saudi Arabia", "HZ"),
+    (0x06A000, 0x06AFFF, "Qatar", "A7"),
+    (0x700000, 0x700FFF, "Kuwait", "9K"),
+    (0x70C000, 0x70CFFF, "Bahrain", "A9C"),
+    (0x780000, 0x7BFFFF, "China", "B"),
+    (0x840000, 0x87FFFF, "Japan", "JA"),
+    (0xC00000, 0xC3FFFF, "Canada", "C"),
+    (0x7C0000, 0x7FFFFF, "Australia", "VH"),
+    (0xE00000, 0xE3FFFF, "Brazil", "PP"),
+    (0x340000, 0x37FFFF, "Spain", "EC"),
+    (0x490000, 0x497FFF, "Portugal", "CS"),
+    (0x458000, 0x45FFFF, "Denmark", "OY"),
+    (0x4A8000, 0x4AFFFF, "Sweden", "SE"),
+    (0x478000, 0x47FFFF, "Norway", "LN"),
+    (0x460000, 0x467FFF, "Finland", "OH"),
+    (0x498000, 0x49FFFF, "Poland", "SP"),
+    (0x488000, 0x48FFFF, "Czech Republic", "OK"),
+)
+
+def get_icao_country(icao_hex: str) -> Tuple[Optional[str], Optional[str]]:
+    """Resolves country name and civil registration prefix from ICAO 24-bit address."""
+    try:
+        val = int(icao_hex, 16)
+    except ValueError:
+        return None, None
+    for low, high, country, prefix in _ICAO_COUNTRY_RANGES:
+        if low <= val <= high:
+            return country, prefix
+    return None, None
+
+
+class AircraftMetadataDB:
+    """
+    Offline Aircraft Metadata Database.
+    Automatically detects and parses offline database files:
+      1. aircraft.csv.gz / aircraft.csv (tar1090-db / readsb semicolon-delimited)
+      2. aircraftDatabase.csv (OpenSky Network comma-delimited)
+      3. aircraft_db.csv (bundled starter database)
+    Works 100% offline with zero network connectivity required.
+    """
+    def __init__(self, search_dir: Optional[str] = None):
+        self.db: Dict[str, Dict[str, str]] = {}
+        target_dir = search_dir or os.path.dirname(__file__)
+        self.loaded_source: Optional[str] = None
+        self._load_database(target_dir)
+
+    def _load_database(self, base_dir: str):
+        candidates = [
+            os.path.join(base_dir, "aircraft.csv.gz"),
+            os.path.join(base_dir, "aircraft.csv"),
+            os.path.join(base_dir, "aircraftDatabase.csv"),
+            os.path.join(base_dir, "aircraft-database.csv"),
+            os.path.join(base_dir, "aircraft_db.csv"),
+        ]
+
+        for path in candidates:
+            if os.path.exists(path):
+                try:
+                    self._parse_file(path)
+                    self.loaded_source = os.path.basename(path)
+                    break
+                except Exception as e:
+                    print(f"[WARNING] Failed to parse {path}: {e}")
+
+    def _parse_file(self, path: str):
+        is_gz = path.endswith(".gz")
+        opener = gzip.open(path, "rt", encoding="utf-8", errors="ignore") if is_gz else open(path, "r", encoding="utf-8", errors="ignore")
+
+        with opener as f:
+            first_line = f.readline()
+            if not first_line:
+                return
+
+            if ";" in first_line:
+                # tar1090-db format: icao;registration;type;flags;description;operator
+                f.seek(0)
+                for line in f:
+                    parts = line.strip().split(";")
+                    if len(parts) >= 3:
+                        icao = parts[0].strip().upper()
+                        if icao and len(icao) == 6:
+                            self.db[icao] = {
+                                "reg": parts[1].strip(),
+                                "type": parts[2].strip(),
+                                "model": parts[4].strip() if len(parts) > 4 else "",
+                                "operator": parts[5].strip() if len(parts) > 5 else ""
+                            }
+            else:
+                # CSV format (bundled or OpenSky)
+                f.seek(0)
+                reader = csv.reader(f)
+                header = [h.strip().lower() for h in next(reader, [])]
+
+                icao_idx = -1
+                reg_idx = -1
+                type_idx = -1
+                model_idx = -1
+                op_idx = -1
+
+                for i, col in enumerate(header):
+                    if col in ("icao", "icao24"):
+                        icao_idx = i
+                    elif col in ("registration", "reg"):
+                        reg_idx = i
+                    elif col in ("type", "typecode"):
+                        type_idx = i
+                    elif col in ("model", "description"):
+                        model_idx = i
+                    elif col in ("operator", "owner", "operatorcallsign"):
+                        op_idx = i
+
+                if icao_idx != -1:
+                    for row in reader:
+                        if len(row) > icao_idx:
+                            icao = row[icao_idx].strip().upper()
+                            if icao and len(icao) == 6:
+                                self.db[icao] = {
+                                    "reg": row[reg_idx].strip() if reg_idx != -1 and len(row) > reg_idx else "",
+                                    "type": row[type_idx].strip() if type_idx != -1 and len(row) > type_idx else "",
+                                    "model": row[model_idx].strip() if model_idx != -1 and len(row) > model_idx else "",
+                                    "operator": row[op_idx].strip() if op_idx != -1 and len(row) > op_idx else ""
+                                }
+
+    def lookup(self, icao_hex: str) -> Dict[str, str]:
+        icao_hex = icao_hex.strip().upper()
+        res = self.db.get(icao_hex, {}).copy()
+        country, prefix = get_icao_country(icao_hex)
+        res["country"] = country or "Unknown"
+        res["country_prefix"] = prefix or ""
+        if "reg" not in res:
+            res["reg"] = ""
+        if "type" not in res:
+            res["type"] = ""
+        if "model" not in res:
+            res["model"] = ""
+        if "operator" not in res:
+            res["operator"] = ""
+        return res
+
+# ============================================================================
+# SECTION 3: Pure-Python ADS-B / Mode-S Decoding Engine
 # ============================================================================
 
 _CRC_POLY = 0xFFF409
@@ -391,7 +560,7 @@ def decode_message(hex_str: str) -> dict:
     return result
 
 # ============================================================================
-# SECTION 3: UDP Broadcaster & Client Networking
+# SECTION 4: UDP Broadcaster & Client Networking
 # ============================================================================
 
 class UdpBroadcaster:
@@ -448,6 +617,7 @@ class UdpAdsbClient:
         self.sock.bind((self.host, self.port))
         if self.timeout:
             self.sock.settimeout(self.timeout)
+        self.db = AircraftMetadataDB()
         self.aircraft_history: Dict[str, Dict[str, Any]] = {}
 
     def listen(self) -> Generator[Dict[str, Any], None, None]:
@@ -463,10 +633,16 @@ class UdpAdsbClient:
                             icao = dec.get('icao')
                             now = time.time()
                             if icao not in self.aircraft_history:
+                                meta = self.db.lookup(icao)
                                 self.aircraft_history[icao] = {
                                     'icao': icao, 'callsign': None, 'altitude': None,
                                     'speed': None, 'heading': None, 'latitude': None,
-                                    'longitude': None, 'distance_km': None, 'last_seen': now
+                                    'longitude': None, 'distance_km': None, 'last_seen': now,
+                                    'reg': meta.get('reg', ''),
+                                    'type': meta.get('type', ''),
+                                    'model': meta.get('model', ''),
+                                    'operator': meta.get('operator', ''),
+                                    'country': meta.get('country', '')
                                 }
                             entry = self.aircraft_history[icao]
                             entry['last_seen'] = now
@@ -511,7 +687,7 @@ class UdpAdsbClient:
             pass
 
 # ============================================================================
-# SECTION 4: Aircraft Telemetry Tracker Store
+# SECTION 5: Aircraft Telemetry Tracker Store
 # ============================================================================
 
 class RadarTracker:
@@ -531,6 +707,7 @@ class RadarTracker:
         self.stale_timeout = config.get("radar", {}).get("stale_timeout_seconds", 10.0)
         self.cpr_max_interval = config.get("radar", {}).get("cpr_pair_max_interval_seconds", 10.0)
 
+        self.db = AircraftMetadataDB()
         self.aircraft = {}
         self.lock = threading.RLock()
         self.total_msgs = 0
@@ -581,9 +758,21 @@ class RadarTracker:
 
         with self.lock:
             if icao not in self.aircraft:
+                meta = self.db.lookup(icao)
+                reg = meta.get('reg') or ''
+                atype = meta.get('type') or ''
+                op = meta.get('operator') or ''
+                country = meta.get('country') or ''
+
                 self.aircraft[icao] = {
                     'icao': icao,
                     'callsign': '------',
+                    'reg': reg,
+                    'type': atype,
+                    'model': meta.get('model', ''),
+                    'operator': op,
+                    'country': country,
+                    'country_prefix': meta.get('country_prefix', ''),
                     'altitude': None,
                     'speed': None,
                     'track': None,
@@ -601,8 +790,20 @@ class RadarTracker:
                     'last_rssi': rssi,
                     'msg_count': 0
                 }
+
+                desc_parts = []
+                if reg:
+                    desc_parts.append(reg)
+                if atype:
+                    desc_parts.append(f"({atype})")
+                if op:
+                    desc_parts.append(f"- {op}")
+                elif country and country != "Unknown":
+                    desc_parts.append(f"[{country}]")
+
+                desc_str = f" {' '.join(desc_parts)}" if desc_parts else ""
                 rssi_str = f" (RSSI: {rssi} dBm)" if rssi is not None else ""
-                self.log_event(f"NEW AIRCRAFT: ICAO {icao}{rssi_str}")
+                self.log_event(f"NEW AIRCRAFT: ICAO {icao}{desc_str}{rssi_str}")
 
             ac = self.aircraft[icao]
             ac['msg_count'] += 1
@@ -616,7 +817,8 @@ class RadarTracker:
                 cs = dec['callsign'].strip('_ ')
                 if cs and ac['callsign'] != cs:
                     ac['callsign'] = cs
-                    self.log_event(f"ICAO {icao} Callsign: {cs}")
+                    meta_tag = f" ({ac['reg']} {ac['type']})" if ac.get('reg') else ""
+                    self.log_event(f"ICAO {icao} Callsign: {cs}{meta_tag}")
 
             # 2. Position & Altitude
             if tc and 9 <= tc <= 18:
@@ -667,10 +869,12 @@ class RadarTracker:
                         ac['bearing_deg'] = b_deg
                         ac['bearing_cardinal'] = b_card
                         if first_fix:
-                            self.log_event(f"ICAO {icao} Position solved: {dist_km:.1f} km away ({b_card})")
+                            reg_info = f" ({ac['reg']})" if ac.get('reg') else ""
+                            self.log_event(f"ICAO {icao}{reg_info} Position solved: {dist_km:.1f} km away ({b_card})")
                     else:
                         if first_fix:
-                            self.log_event(f"ICAO {icao} Global Position solved: {lat:.4f}, {lon:.4f}")
+                            reg_info = f" ({ac['reg']})" if ac.get('reg') else ""
+                            self.log_event(f"ICAO {icao}{reg_info} Global Position: {lat:.4f}, {lon:.4f}")
 
             # 3. Velocity
             elif tc == 19:
@@ -697,7 +901,7 @@ class RadarTracker:
         return len(to_remove)
 
 # ============================================================================
-# SECTION 5: Terminal Dashboard Renderers (Rich & Pure-ANSI)
+# SECTION 6: Terminal Dashboard Renderers (Rich & Pure-ANSI)
 # ============================================================================
 
 def render_rich_view(tracker: RadarTracker, port_info: str):
@@ -718,9 +922,12 @@ def render_rich_view(tracker: RadarTracker, port_info: str):
         conn_status = tracker.status_message
         is_conn = tracker.is_connected
         has_obs = tracker.has_observer
+        db_count = len(tracker.db.db)
+        db_src = tracker.db.loaded_source
 
     obs_str = f"Observer: ({tracker.observer_lat:.4f}, {tracker.observer_lon:.4f})" if has_obs else "Observer: Not Set (Global CPR Mode)"
     status_style = "bold green" if is_conn else "bold yellow"
+    db_tag = f" | DB: {db_count:,} ({db_src})" if db_src else ""
 
     header_text = Text()
     header_text.append(" ADS-B TERMINAL RADAR ", style="bold white on blue")
@@ -734,7 +941,7 @@ def render_rich_view(tracker: RadarTracker, port_info: str):
     header_text.append(f"{total_msgs} ", style="bold yellow")
     header_text.append(f"| Packets: ", style="bold")
     header_text.append(f"{raw_packets} ", style="dim")
-    header_text.append(f"| Prune: {int(tracker.prune_timeout)}s", style="dim")
+    header_text.append(f"{db_tag} | Prune: {int(tracker.prune_timeout)}s", style="dim")
 
     header_panel = Panel(header_text, border_style="blue", padding=(0, 1))
 
@@ -749,6 +956,7 @@ def render_rich_view(tracker: RadarTracker, port_info: str):
     table.add_column("STAT", justify="center")
     table.add_column("ICAO", justify="center", style="bold cyan")
     table.add_column("CALLSIGN", justify="center", style="bold yellow")
+    table.add_column("REG / TYPE", justify="center", style="bold magenta")
     table.add_column("ALTITUDE (V/S)", justify="right")
     table.add_column("SPEED & HDG", justify="center")
     table.add_column("COORDINATES", justify="center")
@@ -760,11 +968,11 @@ def render_rich_view(tracker: RadarTracker, port_info: str):
 
     if not aircraft_list:
         idle_row = [
-            "[dim]IDLE[/]", "------", "------", "[dim]---[/]", "[dim]---[/]",
+            "[dim]IDLE[/]", "------", "------", "[dim]---[/]", "[dim]---[/]", "[dim]---[/]",
             "[dim]Searching for aircraft in range...[/]", "---", "---", "0"
         ]
         if has_obs:
-            idle_row.insert(6, "---")
+            idle_row.insert(7, "---")
         table.add_row(*idle_row)
     else:
         for ac in aircraft_list:
@@ -772,6 +980,20 @@ def render_rich_view(tracker: RadarTracker, port_info: str):
             status = "[bold green]LIVE[/]" if age < tracker.stale_timeout else f"[bold yellow]{int(age)}s[/]"
             icao = ac['icao']
             callsign = ac['callsign'] if ac['callsign'] != '------' else "[dim]------[/]"
+
+            # Metadata Registration & Type
+            reg_val = ac.get('reg')
+            type_val = ac.get('type')
+            if reg_val and type_val:
+                reg_type_str = f"[bold magenta]{reg_val}[/] [dim]({type_val})[/]"
+            elif reg_val:
+                reg_type_str = f"[bold magenta]{reg_val}[/]"
+            elif type_val:
+                reg_type_str = f"[dim]({type_val})[/]"
+            elif ac.get('country') and ac.get('country') != "Unknown":
+                reg_type_str = f"[dim]{ac.get('country')}[/]"
+            else:
+                reg_type_str = "[dim]---[/]"
 
             alt_val = ac['altitude']
             vr_val = ac['vertical_rate']
@@ -804,7 +1026,7 @@ def render_rich_view(tracker: RadarTracker, port_info: str):
             else:
                 rssi_str = "[dim]---[/]"
 
-            row_items = [status, icao, callsign, alt_str, spd_str, coord_str]
+            row_items = [status, icao, callsign, reg_type_str, alt_str, spd_str, coord_str]
             if has_obs:
                 dist_str = f"[bold magenta]{ac['dist_km']:.1f} km[/] [yellow]{ac['bearing_cardinal']}[/]" if ac['dist_km'] else "[dim]---[/]"
                 row_items.append(dist_str)
@@ -832,19 +1054,22 @@ def render_ansi_fallback(tracker: RadarTracker, port_info: str):
         events = list(tracker.recent_events)
         conn_status = tracker.status_message
         has_obs = tracker.has_observer
+        db_count = len(tracker.db.db)
+        db_src = tracker.db.loaded_source
 
     obs_str = f"Observer: ({tracker.observer_lat:.4f}, {tracker.observer_lon:.4f})" if has_obs else "Observer: Not Configured"
+    db_tag = f" | DB: {db_count:,} ({db_src})" if db_src else ""
 
-    out = ["\033[H", "=" * 96]
+    out = ["\033[H", "=" * 110]
     out.append(f" ADS-B RADAR  [{conn_status}]  Source: {port_info} | {obs_str}")
-    out.append(f" Active: {active_count} | Rate: {msg_rate} msg/s | Decoded: {total_msgs} | Packets: {raw_packets} | Prune: {int(tracker.prune_timeout)}s")
-    out.append("=" * 96)
+    out.append(f" Active: {active_count} | Rate: {msg_rate} msg/s | Decoded: {total_msgs} | Packets: {raw_packets}{db_tag} | Prune: {int(tracker.prune_timeout)}s")
+    out.append("=" * 110)
 
     if has_obs:
-        out.append(f" {'STAT':<5} | {'ICAO':<6} | {'CALLSIGN':<8} | {'ALTITUDE (V/S)':<18} | {'SPEED & HDG':<16} | {'COORDINATES':<15} | {'RANGE & BRG':<11} | {'RSSI':<7} | {'SEEN':<5} | {'MSGS':<4}")
+        out.append(f" {'STAT':<5} | {'ICAO':<6} | {'CALLSIGN':<8} | {'REG / TYPE':<14} | {'ALTITUDE (V/S)':<17} | {'SPEED & HDG':<15} | {'COORDINATES':<15} | {'RANGE & BRG':<11} | {'RSSI':<7} | {'SEEN':<5} | {'MSGS':<4}")
     else:
-        out.append(f" {'STAT':<5} | {'ICAO':<6} | {'CALLSIGN':<8} | {'ALTITUDE (V/S)':<18} | {'SPEED & HDG':<16} | {'COORDINATES':<22} | {'RSSI':<7} | {'SEEN':<5} | {'MSGS':<4}")
-    out.append("-" * 96)
+        out.append(f" {'STAT':<5} | {'ICAO':<6} | {'CALLSIGN':<8} | {'REG / TYPE':<14} | {'ALTITUDE (V/S)':<17} | {'SPEED & HDG':<15} | {'COORDINATES':<22} | {'RSSI':<7} | {'SEEN':<5} | {'MSGS':<4}")
+    out.append("-" * 110)
 
     if not aircraft_list:
         out.append(" Searching for aircraft in range...")
@@ -854,6 +1079,20 @@ def render_ansi_fallback(tracker: RadarTracker, port_info: str):
             stat = "LIVE" if age < tracker.stale_timeout else f"{int(age)}s"
             icao = ac['icao']
             call = ac['callsign']
+
+            reg_val = ac.get('reg')
+            type_val = ac.get('type')
+            if reg_val and type_val:
+                reg_type = f"{reg_val} ({type_val})"
+            elif reg_val:
+                reg_type = reg_val
+            elif type_val:
+                reg_type = f"({type_val})"
+            elif ac.get('country') and ac.get('country') != "Unknown":
+                reg_type = ac.get('country')[:14]
+            else:
+                reg_type = "---"
+
             alt = f"{ac['altitude']:,}ft" if ac['altitude'] else "---"
             if ac['vertical_rate']:
                 alt += f" ({ac['vertical_rate']:+d})"
@@ -863,24 +1102,24 @@ def render_ansi_fallback(tracker: RadarTracker, port_info: str):
 
             if has_obs:
                 dist = f"{ac['dist_km']:.1f}km {ac['bearing_cardinal']}" if ac['dist_km'] else "---"
-                out.append(f" {stat:<5} | {icao:<6} | {call:<8} | {alt:<18} | {spd:<16} | {coords:<15} | {dist:<11} | {rssi:<7} | {age:.1f}s | {ac['msg_count']:<4}")
+                out.append(f" {stat:<5} | {icao:<6} | {call:<8} | {reg_type:<14} | {alt:<17} | {spd:<15} | {coords:<15} | {dist:<11} | {rssi:<7} | {age:.1f}s | {ac['msg_count']:<4}")
             else:
-                out.append(f" {stat:<5} | {icao:<6} | {call:<8} | {alt:<18} | {spd:<16} | {coords:<22} | {rssi:<7} | {age:.1f}s | {ac['msg_count']:<4}")
+                out.append(f" {stat:<5} | {icao:<6} | {call:<8} | {reg_type:<14} | {alt:<17} | {spd:<15} | {coords:<22} | {rssi:<7} | {age:.1f}s | {ac['msg_count']:<4}")
 
-    out.append("=" * 96)
+    out.append("=" * 110)
     out.append("Radio Activity Feed:")
     if events:
         for ev in events:
             out.append(f"  {ev}")
     else:
         out.append("  Listening for 1090 MHz squitters...")
-    out.append("=" * 96)
+    out.append("=" * 110)
 
     sys.stdout.write("\n".join(out) + "\n")
     sys.stdout.flush()
 
 # ============================================================================
-# SECTION 6: Background Worker Threads
+# SECTION 7: Background Worker Threads
 # ============================================================================
 
 def udp_reader_worker(
@@ -1042,7 +1281,7 @@ def file_reader_worker(
         time.sleep(1.0)
 
 # ============================================================================
-# SECTION 7: Main Entrypoint & Mode Dispatcher
+# SECTION 8: Main Entrypoint & Mode Dispatcher
 # ============================================================================
 
 def main():
@@ -1101,7 +1340,8 @@ def main():
                     print(json.dumps(ac, default=str))
                 else:
                     ts = datetime.now().strftime("%H:%M:%S")
-                    print(f"[{ts}] ICAO: {ac['icao']} | CALL: {ac.get('callsign') or '----':<8} | ALT: {ac.get('altitude') or '----'} | POS: ({ac.get('latitude')}, {ac.get('longitude')})")
+                    reg_info = f" | {ac.get('reg')} ({ac.get('type')})" if ac.get('reg') else ""
+                    print(f"[{ts}] ICAO: {ac['icao']}{reg_info} | CALL: {ac.get('callsign') or '----':<8} | ALT: {ac.get('altitude') or '----'} | POS: ({ac.get('latitude')}, {ac.get('longitude')})")
         except KeyboardInterrupt:
             print("\n[*] Stopped UDP client.")
         finally:

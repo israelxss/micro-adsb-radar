@@ -1,0 +1,100 @@
+icao,registration,type,model,operator
+738041,4X-EAA,B772,Boeing 777-200ER,El Al Israel Airlines
+738042,4X-EAB,B772,Boeing 777-200ER,El Al Israel Airlines
+738043,4X-EAC,B772,Boeing 777-200ER,El Al Israel Airlines
+738044,4X-EAD,B772,Boeing 777-200ER,El Al Israel Airlines
+738045,4X-EAE,B772,Boeing 777-200ER,El Al Israel Airlines
+738046,4X-EAF,B772,Boeing 777-200ER,El Al Israel Airlines
+738061,4X-EKA,B738,Boeing 737-800,El Al Israel Airlines
+738062,4X-EKB,B738,Boeing 737-800,El Al Israel Airlines
+738063,4X-EKC,B738,Boeing 737-800,El Al Israel Airlines
+738064,4X-EKD,B738,Boeing 737-800,El Al Israel Airlines
+738065,4X-EKE,B738,Boeing 737-800,El Al Israel Airlines
+738066,4X-EKF,B738,Boeing 737-800,El Al Israel Airlines
+738067,4X-EKH,B738,Boeing 737-800,El Al Israel Airlines
+738068,4X-EKJ,B738,Boeing 737-800,El Al Israel Airlines
+738069,4X-EKL,B738,Boeing 737-800,El Al Israel Airlines
+73806A,4X-EKM,B738,Boeing 737-800,El Al Israel Airlines
+73806B,4X-EKN,B738,Boeing 737-800,El Al Israel Airlines
+73806C,4X-EKO,B738,Boeing 737-800,El Al Israel Airlines
+73806D,4X-EKP,B738,Boeing 737-800,El Al Israel Airlines
+738071,4X-EHA,B739,Boeing 737-900ER,El Al Israel Airlines
+738072,4X-EHB,B739,Boeing 737-900ER,El Al Israel Airlines
+738073,4X-EHC,B739,Boeing 737-900ER,El Al Israel Airlines
+738074,4X-EHD,B739,Boeing 737-900ER,El Al Israel Airlines
+738075,4X-EHE,B739,Boeing 737-900ER,El Al Israel Airlines
+738076,4X-EHF,B739,Boeing 737-900ER,El Al Israel Airlines
+738077,4X-EHH,B739,Boeing 737-900ER,El Al Israel Airlines
+738078,4X-EHI,B739,Boeing 737-900ER,El Al Israel Airlines
+738485,4X-EDA,B789,Boeing 787-9 Dreamliner,El Al Israel Airlines
+738486,4X-EDB,B789,Boeing 787-9 Dreamliner,El Al Israel Airlines
+738487,4X-EDC,B789,Boeing 787-9 Dreamliner,El Al Israel Airlines
+738488,4X-EDD,B789,Boeing 787-9 Dreamliner,El Al Israel Airlines
+738489,4X-EDE,B789,Boeing 787-9 Dreamliner,El Al Israel Airlines
+73848A,4X-EDF,B789,Boeing 787-9 Dreamliner,El Al Israel Airlines
+73848B,4X-EDH,B789,Boeing 787-9 Dreamliner,El Al Israel Airlines
+73848C,4X-EDI,B789,Boeing 787-9 Dreamliner,El Al Israel Airlines
+73848D,4X-EDJ,B789,Boeing 787-9 Dreamliner,El Al Israel Airlines
+73848E,4X-EDK,B789,Boeing 787-9 Dreamliner,El Al Israel Airlines
+73848F,4X-EDL,B789,Boeing 787-9 Dreamliner,El Al Israel Airlines
+738490,4X-EDM,B789,Boeing 787-9 Dreamliner,El Al Israel Airlines
+738491,4X-ERA,B788,Boeing 787-8 Dreamliner,El Al Israel Airlines
+738492,4X-ERB,B788,Boeing 787-8 Dreamliner,El Al Israel Airlines
+738493,4X-ERC,B788,Boeing 787-8 Dreamliner,El Al Israel Airlines
+738494,4X-ERD,B788,Boeing 787-8 Dreamliner,El Al Israel Airlines
+738101,4X-EMA,E195,Embraer E195,Arkia Israeli Airlines
+738102,4X-EMB,E195,Embraer E195,Arkia Israeli Airlines
+738103,4X-EMC,E190,Embraer E190,Arkia Israeli Airlines
+738121,4X-AGH,A321,Airbus A321neo,Arkia Israeli Airlines
+738122,4X-AGI,A321,Airbus A321neo,Arkia Israeli Airlines
+738141,4X-ABI,A320,Airbus A320-232,Israir Airlines
+738142,4X-ABJ,A320,Airbus A320-232,Israir Airlines
+738143,4X-ABG,A320,Airbus A320-232,Israir Airlines
+738144,4X-ABF,A320,Airbus A320-232,Israir Airlines
+738161,4X-ICB,B744,Boeing 747-400F,Challenge Airlines IL
+738162,4X-ICA,B744,Boeing 747-400F,Challenge Airlines IL
+738181,4X-IHA,AT76,ATR 72-600,Air Haifa
+738182,4X-IHB,AT76,ATR 72-600,Air Haifa
+4A482D,YR-RAM,A320,Airbus A320-232,Israir / HelloJets
+4A4907,4X-CLF,CL60,Bombardier Challenger 604,Private Jet
+4520D2,OY-KBO,A319,Airbus A319-132,Scandinavian Airlines (SAS)
+4840D6,PH-BXO,B738,Boeing 737-8K2,KLM Royal Dutch Airlines
+8961D0,A6-EOZ,A388,Airbus A380-861,Emirates
+896474,A6-EVN,A388,Airbus A380-842,Emirates
+8964A1,A6-FKB,B38M,Boeing 737 MAX 8,flydubai
+8964A2,A6-FKC,B38M,Boeing 737 MAX 8,flydubai
+4BA960,TC-JRO,A321,Airbus A321-231,Turkish Airlines
+4BA961,TC-JRP,A321,Airbus A321-231,Turkish Airlines
+4BB233,TC-LND,A359,Airbus A350-941,Turkish Airlines
+4BCB84,TC-NCI,A20N,Airbus A320-251N,Pegasus Airlines
+4BCB85,TC-NCJ,A20N,Airbus A320-251N,Pegasus Airlines
+4C8241,5B-DCJ,A320,Airbus A320-232,Cyprus Airways
+4C8242,5B-DDM,A223,Airbus A220-300,Cyprus Airways
+4C8243,5B-DDN,A223,Airbus A220-300,Cyprus Airways
+46B554,SX-DNE,A320,Airbus A320-232,Aegean Airlines
+46B555,SX-DNF,A320,Airbus A320-232,Aegean Airlines
+46B831,SX-NAA,A21N,Airbus A321-271NX,Aegean Airlines
+471F51,HA-LVD,A21N,Airbus A321-271NX,Wizz Air
+471F52,HA-LVE,A21N,Airbus A321-271NX,Wizz Air
+471F53,HA-LVF,A21N,Airbus A321-271NX,Wizz Air
+4D2281,9H-WNB,A21N,Airbus A321-271NX,Wizz Air Malta
+4D2282,9H-WNC,A21N,Airbus A321-271NX,Wizz Air Malta
+4CA152,EI-EGA,B738,Boeing 737-8AS,Ryanair
+4CA153,EI-EGB,B738,Boeing 737-8AS,Ryanair
+4CA154,EI-EGC,B738,Boeing 737-8AS,Ryanair
+3C6581,D-AIED,A21N,Airbus A321-271NX,Lufthansa
+3C6582,D-AIEE,A21N,Airbus A321-271NX,Lufthansa
+3C6583,D-AIEF,A21N,Airbus A321-271NX,Lufthansa
+400811,G-XWBA,A351,Airbus A350-1041,British Airways
+400812,G-XWBB,A351,Airbus A350-1041,British Airways
+407221,G-ZBKA,B789,Boeing 787-9 Dreamliner,British Airways
+A01234,N1234A,B763,Boeing 767-332ER,Delta Air Lines
+A05678,N5678B,B772,Boeing 777-222ER,United Airlines
+A09ABC,N901AA,B773,Boeing 777-323ER,American Airlines
+381241,F-HZUA,A223,Airbus A220-300,Air France
+381242,F-HZUB,A223,Airbus A220-300,Air France
+440241,OE-LBO,A320,Airbus A320-214,Austrian Airlines
+4B1241,HB-JBA,BCS1,Airbus A220-100,Swiss International Air Lines
+300241,I-ADJT,E190,Embraer E190,ITA Airways
+750241,JY-AYT,A320,Airbus A320-232,Royal Jordanian
+750242,JY-AYU,A320,Airbus A320-232,Royal Jordanian
